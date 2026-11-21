@@ -12,6 +12,7 @@ import {
   resolveAcpAuthMethod,
   resolveAgyBinary,
   type AcpDiscoveredModel,
+  type AcpSessionUpdate,
 } from "../src/acp-client.js"
 import {
   API_ERROR_ABORT_PATTERN,
@@ -147,6 +148,89 @@ describe("McpRelayServer", () => {
   })
 })
 
+describe("SessionBridgeManager native ACP tool results", () => {
+  async function streamToolUpdates(updates: readonly AcpSessionUpdate[]) {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+      createProc: ({ onUpdate }) => ({
+        isClosed: false,
+        initialize: async () => ({}),
+        authenticate: async () => ({}),
+        newSession: async () => ({ sessionId: "acp-native-tools" }),
+        setModel: async () => {},
+        setMode: async () => {},
+        notifyCancel: () => {},
+        dispose: async () => {},
+        prompt: async (sessionId: string) => {
+          for (const update of updates) onUpdate?.(sessionId, update)
+          return { stopReason: "end_turn" }
+        },
+      } as any),
+    })
+    try {
+      const lm = bridge.createLanguageModel("gemini-4-neon")
+      const { stream } = await lm.doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "Check the tool result" }] }],
+        headers: { "x-opencode-session-id": "ses-native-tools" },
+      })
+      return await readAllParts(stream)
+    } finally {
+      await bridge.disposeAll()
+    }
+  }
+
+  test("keeps the announced tool name on terminal updates with an omitted or changed name", async () => {
+    const parts = await streamToolUpdates([
+      { sessionUpdate: "tool_call", toolCallId: "read", name: "read_file", status: "pending" },
+      { sessionUpdate: "tool_call", toolCallId: "run", name: "run_command", status: "in_progress" },
+      { sessionUpdate: "tool_call_update", toolCallId: "read", status: "completed", rawOutput: "file text" },
+      { sessionUpdate: "tool_call_update", toolCallId: "run", name: "execute", status: "failed", rawOutput: "command failed" },
+    ])
+
+    const calls = parts.filter((p) => p.type === "tool-call")
+    expect(calls.map((p) => [p.toolCallId, p.toolName])).toEqual([
+      ["read", "acp_read_file"],
+      ["run", "acp_run_command"],
+    ])
+    const results = parts.filter((p) => p.type === "tool-result")
+    expect(results.map((p) => [p.toolCallId, p.toolName, p.result, p.isError])).toEqual([
+      ["read", "acp_read_file", "file text", false],
+      ["run", "acp_run_command", "command failed", true],
+    ])
+  })
+
+  test("marks an unfinished tool as unknown with its original name when the turn ends", async () => {
+    const parts = await streamToolUpdates([
+      { sessionUpdate: "tool_call", toolCallId: "run", name: "run_command", status: "pending" },
+      { sessionUpdate: "tool_call_update", toolCallId: "run", status: "in_progress", kind: "execute" },
+    ])
+
+    const results = parts.filter((p) => p.type === "tool-result")
+    expect(results).toHaveLength(1)
+    expect(results[0]).toMatchObject({
+      toolCallId: "run",
+      toolName: "acp_run_command",
+      result: { status: "unknown" },
+      isError: true,
+    })
+    expect(parts.at(-1)?.finishReason?.unified).toBe("stop")
+  })
+
+  test("uses the result when the initial tool call already reports a terminal status", async () => {
+    const parts = await streamToolUpdates([
+      { sessionUpdate: "tool_call", toolCallId: "read", kind: "read", status: "completed", rawOutput: "file text" },
+    ])
+
+    const results = parts.filter((p) => p.type === "tool-result")
+    expect(results).toHaveLength(1)
+    expect(results[0]).toMatchObject({
+      toolCallId: "read",
+      toolName: "acp_read",
+      result: "file text",
+      isError: false,
+    })
+  })
+})
+
 describe("SessionBridgeManager lifecycle & cached discovery", () => {
   afterEach(() => {
     resetSharedCatalogForTests()
@@ -180,7 +264,7 @@ describe("SessionBridgeManager lifecycle & cached discovery", () => {
     const turnObj: any = {
       bufferedParts: [],
       partSeq: 0,
-      activeNativeTools: new Set(),
+      activeNativeTools: new Map(),
       relayedUpdateIds: new Set(),
       pendingMcpCalls: new Map([
         [
@@ -201,6 +285,12 @@ describe("SessionBridgeManager lifecycle & cached discovery", () => {
     }
     const activeStream = (bridge as any).createBoundStream(sessionObj, turnObj, undefined, () => {})
     sessionObj.activeTurn = turnObj
+    ;(bridge as any).handleAcpUpdate(sessionObj, {
+      sessionUpdate: "tool_call",
+      toolCallId: "native-1",
+      name: "run_command",
+      status: "in_progress",
+    })
 
     const streamReaderPromise = readAllParts(activeStream)
     await bridge.disposeAll()
@@ -208,6 +298,12 @@ describe("SessionBridgeManager lifecycle & cached discovery", () => {
     const mcpResult = (await mcpPromise) as any
     expect(mcpResult.isError).toBe(true)
     expect(midTurnParts.some((p) => p.type === "error")).toBe(false)
+    expect(midTurnParts.find((p) => p.type === "tool-result")).toMatchObject({
+      toolCallId: "native-1",
+      toolName: "acp_run_command",
+      result: { status: "unknown" },
+      isError: true,
+    })
     const midFinish = midTurnParts.find((p) => p.type === "finish")
     expect(midFinish?.finishReason?.unified).toBe("stop")
     expect(midFinish?.finishReason?.raw).toBe("plugin_unloaded")
