@@ -155,6 +155,7 @@ interface BridgeSession {
   settlingPrompt?: Promise<void>
   /** Foreground reservations held by live doStream turns (excluded from idle LRU). */
   foregroundCount?: number
+  lastContextUsed?: number
 }
 
 interface WarmSpare {
@@ -241,10 +242,19 @@ function catalogSignature(models: readonly AcpDiscoveredModel[]): string {
   return JSON.stringify(models.map((m) => [m.id, m.name, m.family, m.defaultAcpModelId, m.variants]))
 }
 
-function zeroUsage(raw?: AcpPromptResult["usage"]): LanguageModelV3Usage {
-  const inputTotal = raw?.inputTokens
-  const cacheRead = raw?.cachedReadTokens
-  const cacheWrite = raw?.cachedWriteTokens
+function zeroUsage(
+  raw?: AcpPromptResult["usage"],
+  activeContextUsed?: number,
+): LanguageModelV3Usage {
+  const inputTotal = activeContextUsed !== undefined ? activeContextUsed : raw?.inputTokens
+  const cacheRead =
+    raw?.cachedReadTokens !== undefined && inputTotal !== undefined
+      ? Math.min(raw.cachedReadTokens, inputTotal)
+      : raw?.cachedReadTokens
+  const cacheWrite =
+    raw?.cachedWriteTokens !== undefined && inputTotal !== undefined
+      ? Math.min(raw.cachedWriteTokens, Math.max(0, inputTotal - (cacheRead ?? 0)))
+      : raw?.cachedWriteTokens
   const outputTotal = raw?.outputTokens
   const reasoning = raw?.thoughtTokens
   const noCache =
@@ -882,6 +892,7 @@ export class SessionBridgeManager {
         s.lastError = null
         s.pendingFreshHandoff = undefined
         s.settlingPrompt = undefined
+        s.lastContextUsed = undefined
         this.untrackWarmedIdle(sessionID)
         await this.runStorageRemove(sessionID)
       } finally {
@@ -1622,6 +1633,13 @@ export class SessionBridgeManager {
       return
     }
 
+    if (kind === "usage_update") {
+      if (typeof update.used === "number" && Number.isFinite(update.used) && update.used >= 0) {
+        s.lastContextUsed = update.used
+      }
+      return
+    }
+
     const turn = s.activeTurn
     if (!turn || turn.abortedOnApiError) return
 
@@ -1827,7 +1845,7 @@ export class SessionBridgeManager {
     this.emitPart(turn, {
       type: "finish",
       finishReason: { unified, raw: stopReason ?? "end_turn" },
-      usage: zeroUsage(turn.promptResult?.usage),
+      usage: zeroUsage(turn.promptResult?.usage, s.lastContextUsed),
       providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
     })
 
