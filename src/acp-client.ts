@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -138,6 +138,12 @@ export interface AcpPromptResult {
     readonly cachedWriteTokens?: number
     readonly thoughtTokens?: number
     readonly totalTokens?: number
+    readonly input_tokens?: number
+    readonly output_tokens?: number
+    readonly cached_read_tokens?: number
+    readonly cached_write_tokens?: number
+    readonly thought_tokens?: number
+    readonly total_tokens?: number
   }
 }
 
@@ -364,13 +370,20 @@ export interface AcpProcessOptions {
     params: AcpPermissionRequestParams,
   ) => Promise<AcpPermissionOutcome>
   readonly onExit?: (code: number | null, signal: NodeJS.Signals | null, stderrTail: string) => void
+  readonly onLog?: (level: "warn" | "debug", message: string, meta?: Record<string, unknown>) => void
 }
 
 interface PendingRpc {
   readonly resolve: (value: any) => void
   readonly reject: (reason?: any) => void
   readonly timer?: ReturnType<typeof setTimeout>
+  readonly signal?: AbortSignal
+  readonly onAbort?: () => void
 }
+
+const MAX_STDOUT_BUFFER_BYTES = 16 * 1024 * 1024
+
+const MAX_STDERR_LINES = 200
 
 export type AcpAuthMethodId =
   | "oauth-personal"
@@ -446,8 +459,11 @@ export class AcpProcess {
   private pending = new Map<number, PendingRpc>()
   private buffer = ""
   private decoder = new StringDecoder("utf8")
+  private stderrDecoder = new StringDecoder("utf8")
   private stderrLines: string[] = []
   private closed = false
+  private exitNotified = false
+  private binary: string
 
   constructor(private readonly options: AcpProcessOptions) {
     const args = ["acp", "--stdio", "--process-per-session"]
@@ -459,14 +475,35 @@ export class AcpProcess {
     }
 
     const binary = options.binaryPath ?? resolveAgyBinary()
+    this.binary = binary
     this.proc = spawn(binary, args, {
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: buildAgySpawnEnv(),
+      detached: process.platform !== "win32",
     })
+
+    this.proc.stdin.on("error", (err) => {
+      this.closed = true
+      this.failAllPending(err)
+    })
+
+    this.proc.stdout.on("error", () => {})
+
+    this.proc.stderr.on("error", () => {})
 
     this.proc.stdout.on("data", (chunk: Buffer) => {
       this.buffer += this.decoder.write(chunk)
+      if (this.buffer.length > MAX_STDOUT_BUFFER_BYTES) {
+        this.buffer = ""
+        this.failAllPending(
+          new Error(
+            `ACP stdout buffer overflow: exceeded ${MAX_STDOUT_BUFFER_BYTES} bytes; agy output too large, killing process`,
+          ),
+        )
+        this.killImmediate()
+        return
+      }
       let nl: number
       while ((nl = this.buffer.indexOf("\n")) !== -1) {
         const line = this.buffer.slice(0, nl).trim()
@@ -476,11 +513,11 @@ export class AcpProcess {
     })
 
     this.proc.stderr.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf8")
+      const text = this.stderrDecoder.write(chunk)
       for (const line of text.split(/\r?\n/)) {
         if (!line.trim()) continue
         this.stderrLines.push(line)
-        if (this.stderrLines.length > 40) this.stderrLines.shift()
+        if (this.stderrLines.length > MAX_STDERR_LINES) this.stderrLines.shift()
       }
     })
 
@@ -501,7 +538,18 @@ export class AcpProcess {
           `agy acp exited unexpectedly (code=${code}, signal=${signal})${tail ? `\n${tail}` : ""}`,
         ),
       )
-      this.options.onExit?.(code, signal, tail)
+      this.notifyExit(code, signal, tail)
+    })
+
+    this.proc.on("close", (code, signal) => {
+      this.closed = true
+      const tail = this.stderrLines.join("\n")
+      this.failAllPending(
+        new Error(
+          `agy acp exited unexpectedly (code=${code}, signal=${signal})${tail ? `\n${tail}` : ""}`,
+        ),
+      )
+      this.notifyExit(code, signal, tail)
     })
   }
 
@@ -509,9 +557,64 @@ export class AcpProcess {
     return this.closed
   }
 
+  private notifyExit(
+    code: number | null,
+    signal: NodeJS.Signals | null,
+    tail: string,
+  ): void {
+    if (this.exitNotified) return
+    this.exitNotified = true
+    this.options.onExit?.(code, signal, tail)
+  }
+
+  private signalProcess(sig: NodeJS.Signals): void {
+    const pid = this.proc.pid
+    if (pid === undefined) {
+      try {
+        this.proc.kill(sig)
+      } catch {}
+      return
+    }
+    if (process.platform === "win32") {
+      if (sig === "SIGKILL") {
+        try {
+          execFile("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true }, () => {})
+          return
+        } catch {}
+      }
+      try {
+        this.proc.kill(sig)
+      } catch {}
+      return
+    }
+    try {
+      process.kill(-pid, sig)
+    } catch {
+      try {
+        this.proc.kill(sig)
+      } catch {}
+    }
+  }
+
+  private destroyStreams(): void {
+    try {
+      this.proc.stdin.end?.()
+    } catch {}
+    for (const stream of [this.proc.stdin, this.proc.stdout, this.proc.stderr] as const) {
+      try {
+        ;(stream as unknown as { destroy?: () => void }).destroy?.()
+      } catch {}
+    }
+  }
+
   private failAllPending(err: Error): void {
     for (const [id, entry] of this.pending) {
       if (entry.timer) clearTimeout(entry.timer)
+      if (entry.signal && entry.onAbort) {
+        try {
+          entry.signal.removeEventListener("abort", entry.onAbort)
+        } catch {}
+      }
       this.pending.delete(id)
       entry.reject(err)
     }
@@ -522,14 +625,27 @@ export class AcpProcess {
     try {
       msg = JSON.parse(line)
     } catch {
+      this.options.onLog?.("warn", "Ignoring malformed ACP JSON line", {
+        line: line.slice(0, 500),
+      })
       return
     }
 
     // Response to an outbound request
     if (msg.id !== undefined && msg.method === undefined) {
       const entry = this.pending.get(Number(msg.id))
-      if (!entry) return
+      if (!entry) {
+        this.options.onLog?.("debug", "Ignoring late ACP response for removed request", {
+          id: msg.id,
+        })
+        return
+      }
       if (entry.timer) clearTimeout(entry.timer)
+      if (entry.signal && entry.onAbort) {
+        try {
+          entry.signal.removeEventListener("abort", entry.onAbort)
+        } catch {}
+      }
       this.pending.delete(Number(msg.id))
       if (msg.error) {
         const err = new Error(
@@ -567,6 +683,9 @@ export class AcpProcess {
           : await this.fallbackAutoSelect(params)
         this.write({ jsonrpc: "2.0", id, result: { outcome } })
       } catch (err) {
+        this.options.onLog?.("warn", "onPermissionRequest failed; auto-cancelling", {
+          error: err instanceof Error ? err.message : String(err),
+        })
         this.write({
           jsonrpc: "2.0",
           id,
@@ -585,37 +704,98 @@ export class AcpProcess {
 
   private async fallbackAutoSelect(params: AcpPermissionRequestParams): Promise<AcpPermissionOutcome> {
     const opts = params?.options ?? []
-    const allow = opts.find(
-      (o) =>
-        o.kind?.includes("allow") ||
-        o.optionId.includes("allow") ||
-        o.optionId.includes("approve"),
-    )
+    const allow = opts.find((o) => {
+      const kind = (o.kind ?? "").toLowerCase()
+      const optionId = (o.optionId ?? "").toLowerCase()
+      return kind.includes("allow") || optionId.includes("allow") || optionId.includes("approve")
+    })
     if (allow) return { outcome: "selected", optionId: allow.optionId }
     if (opts[0]) return { outcome: "selected", optionId: opts[0].optionId }
     return { outcome: "cancelled" }
   }
 
-  private write(payload: unknown): void {
-    if (this.closed || !this.proc.stdin.writable) return
-    this.proc.stdin.write(`${JSON.stringify(payload)}\n`)
+  private write(payload: unknown): boolean {
+    if (
+      this.closed ||
+      this.proc.exitCode !== null ||
+      this.proc.signalCode !== null ||
+      !this.proc.stdin.writable ||
+      (this.proc.stdin as unknown as { destroyed?: boolean }).destroyed
+    ) {
+      return false
+    }
+    try {
+      let ok = true
+      this.proc.stdin.write(`${JSON.stringify(payload)}\n`, (err) => {
+        if (err) ok = false
+      })
+      return ok
+    } catch {
+      return false
+    }
   }
 
-  request<T = any>(method: string, params: unknown, timeoutMs?: number): Promise<T> {
+  request<T = any>(method: string, params: unknown, timeoutMs?: number, signal?: AbortSignal): Promise<T> {
     if (this.closed) {
       return Promise.reject(new Error(`Cannot call ${method}: agy acp process is closed`))
     }
+    if (signal?.aborted) {
+      return Promise.reject(
+        (signal.reason as Error | undefined) ?? new Error(`ACP request ${method} aborted`),
+      )
+    }
     const id = this.nextId++
     return new Promise<T>((resolve, reject) => {
-      const timer =
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const onAbort = () => {
+        if (this.pending.has(id)) {
+          if (timer) clearTimeout(timer)
+          this.pending.delete(id)
+          try {
+            signal?.removeEventListener("abort", onAbort)
+          } catch {}
+          reject(
+            (signal?.reason as Error | undefined) ??
+              new Error(`ACP request ${method} aborted`),
+          )
+        }
+      }
+      const cleanup = () => {
+        if (timer) clearTimeout(timer)
+        if (signal && onAbort) {
+          try {
+            signal.removeEventListener("abort", onAbort)
+          } catch {}
+        }
+      }
+      timer =
         timeoutMs && timeoutMs > 0
           ? setTimeout(() => {
               this.pending.delete(id)
-              reject(new Error(`ACP request ${method} timed out after ${timeoutMs}ms`))
+              try {
+                signal?.removeEventListener("abort", onAbort)
+              } catch {}
+              const err = new Error(`ACP request ${method} timed out after ${timeoutMs}ms`)
+              ;(err as any).acpTimeout = true
+              reject(err)
             }, timeoutMs)
           : undefined
-      this.pending.set(id, { resolve, reject, timer })
-      this.write({ jsonrpc: "2.0", id, method, params })
+      this.pending.set(id, { resolve, reject, timer, signal, onAbort })
+      if (signal) {
+        try {
+          signal.addEventListener("abort", onAbort, { once: true })
+        } catch {}
+      }
+      const ok = this.write({ jsonrpc: "2.0", id, method, params })
+      if (!ok) {
+        cleanup()
+        this.pending.delete(id)
+        if (this.proc.pid === undefined) {
+          reject(new AgyNotFoundError(this.binary))
+        } else {
+          reject(new Error(`Cannot write ${method}: agy acp pipe is closed`))
+        }
+      }
     })
   }
 
@@ -629,7 +809,7 @@ export class AcpProcess {
       {
         protocolVersion: 1,
         clientCapabilities: {},
-        clientInfo: { name: "acp-bridge", version: "0.2.1" },
+        clientInfo: { name: "acp-bridge", version: "0.2.2" },
       },
       15_000,
     )
@@ -708,34 +888,41 @@ export class AcpProcess {
     }
   }
 
-  prompt(sessionId: string, prompt: readonly AcpContentBlock[]): Promise<AcpPromptResult> {
-    return this.request("session/prompt", { sessionId, prompt }, 0)
+  prompt(
+    sessionId: string,
+    prompt: readonly AcpContentBlock[],
+    options?: { readonly signal?: AbortSignal; readonly timeoutMs?: number },
+  ): Promise<AcpPromptResult> {
+    return this.request("session/prompt", { sessionId, prompt }, options?.timeoutMs ?? 0, options?.signal)
   }
 
   notifyCancel(sessionId: string): void {
     this.notify("session/cancel", { sessionId })
   }
 
-  cancel(sessionId: string): Promise<void> {
-    this.notify("session/cancel", { sessionId })
-    return Promise.resolve()
+  cancel(sessionId: string): Promise<boolean> {
+    const ok = this.write({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } })
+    return Promise.resolve(ok)
   }
 
   killImmediate(): void {
+    if (this.proc.exitCode !== null || this.proc.signalCode !== null) {
+      this.closed = true
+      this.failAllPending(new Error("AcpProcess halted immediately"))
+      this.destroyStreams()
+      return
+    }
     if (this.closed) return
     this.closed = true
     this.failAllPending(new Error("AcpProcess halted immediately"))
-    try {
-      this.proc.kill("SIGTERM")
-    } catch {}
+    this.signalProcess("SIGTERM")
     const timer = setTimeout(() => {
-      try {
-        this.proc.kill("SIGKILL")
-      } catch {}
+      this.signalProcess("SIGKILL")
     }, 500)
     timer.unref?.()
     this.proc.once("exit", () => {
       clearTimeout(timer)
+      this.destroyStreams()
     })
   }
 
@@ -744,23 +931,35 @@ export class AcpProcess {
   }
 
   async dispose(): Promise<void> {
+    if (this.proc.exitCode !== null || this.proc.signalCode !== null) {
+      this.closed = true
+      this.failAllPending(new Error("AcpProcess disposed"))
+      this.destroyStreams()
+      return
+    }
     if (this.closed) return
     this.closed = true
     this.failAllPending(new Error("AcpProcess disposed"))
     try {
-      this.proc.kill("SIGTERM")
+      this.proc.stdin.end()
     } catch {}
+    this.signalProcess("SIGTERM")
     await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        try {
-          this.proc.kill("SIGKILL")
-        } catch {}
-        resolve()
-      }, 1_500)
-      this.proc.once("exit", () => {
+      let settled = false
+      const done = () => {
+        if (settled) return
+        settled = true
         clearTimeout(timer)
+        this.destroyStreams()
         resolve()
-      })
+      }
+      const timer = setTimeout(() => {
+        this.signalProcess("SIGKILL")
+        done()
+      }, 1_500)
+      timer.unref?.()
+      this.proc.once("exit", done)
+      this.proc.once("close", done as (...args: any[]) => void)
     })
   }
 }

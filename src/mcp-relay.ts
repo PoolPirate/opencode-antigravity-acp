@@ -238,7 +238,13 @@ export class McpRelayServer {
         result = {
           protocolVersion: params.protocolVersion ?? "2025-03-26",
           capabilities: { tools: { listChanged: true } },
-          serverInfo: { name: "opencode-relay", version: "0.2.1" },
+          serverInfo: {
+            name: "opencode-relay",
+            title: "OpenCode Code Mode & Tool Relay",
+            version: "0.2.2",
+          },
+          instructions:
+            "OpenCode Code Mode & workspace tool relay. Use `execute` to run JavaScript in OpenCode Code Mode (`tools.<namespace>.<tool>(...)` and `search(...)` for hidden MCP/workspace namespaces), and `subagent` to launch OpenCode subagents (agents: `explore`, `general`, `build`, `plan`; optional `model` as `<provider>/<modelID>`).",
         }
       } else if (method === "tools/list") {
         const tools = this.handlers.getTools(sessionID).map((t) => ({

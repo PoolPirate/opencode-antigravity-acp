@@ -2538,3 +2538,174 @@ describe("CodeRabbit final 8 findings", () => {
     await bridge2.disposeAll()
   })
 })
+
+describe("Token/context window usage reporting", () => {
+  afterEach(() => {
+    resetSharedCatalogForTests()
+  })
+
+  function makeUsageBridge(promptImpl: (onUpdate: any) => (sid: string, prompt: any[]) => Promise<any>) {
+    let onUpdateRef: any
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+      createProc: ({ onUpdate }) => {
+        onUpdateRef = onUpdate
+        return {
+          isClosed: false,
+          initialize: async () => ({}),
+          authenticate: async () => ({}),
+          newSession: async () => ({ sessionId: "acp-usage-1" }),
+          resumeSession: async (params: any) => ({ sessionId: params.sessionId }),
+          setModel: async () => {},
+          setMode: async () => {},
+          setConfigOption: async () => {},
+          closeSession: async () => {},
+          notifyCancel: () => {},
+          cancel: async () => {},
+          prompt: promptImpl(onUpdate),
+          dispose: async () => {},
+        } as any
+      },
+    })
+    return { bridge, getOnUpdate: () => onUpdateRef }
+  }
+
+  test("a) session/prompt usage wins over usage_update (used:0 and used=input+output)", async () => {
+    const fullUsage = {
+      inputTokens: 1000,
+      outputTokens: 200,
+      cachedReadTokens: 300,
+      cachedWriteTokens: 100,
+      thoughtTokens: 50,
+      totalTokens: 1200,
+    }
+    for (const used of [0, 1200]) {
+      const { bridge } = makeUsageBridge((onUpdate) => async (sid: string) => {
+        onUpdate?.(sid, { sessionUpdate: "usage_update", used })
+        return { stopReason: "end_turn", usage: { ...fullUsage } }
+      })
+      const lm = bridge.createLanguageModel("gemini-4-neon")
+      const res = await lm.doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+        headers: { "x-opencode-session-id": `ses-usage-a-${used}` },
+      } as any)
+      const parts = await readAllParts(res.stream)
+      const finish = parts.find((p) => p.type === "finish")
+      expect(finish).toBeDefined()
+      expect(finish.usage.inputTokens.total).toBe(1000)
+      expect(finish.usage.outputTokens.total).toBe(200)
+      expect(finish.usage.outputTokens.text).toBe(150)
+      expect(finish.usage.outputTokens.reasoning).toBe(50)
+      expect(finish.usage.inputTokens.cacheRead).toBe(300)
+      expect(finish.usage.inputTokens.cacheWrite).toBe(100)
+      expect(finish.usage.inputTokens.noCache).toBe(600)
+      await bridge.disposeAll()
+    }
+
+    // snake_case variant
+    const { bridge } = makeUsageBridge((onUpdate) => async (sid: string) => {
+      onUpdate?.(sid, { sessionUpdate: "usage_update", used: 0 })
+      return {
+        stopReason: "end_turn",
+        usage: {
+          input_tokens: 1000,
+          output_tokens: 200,
+          cached_read_tokens: 300,
+          cached_write_tokens: 100,
+          thought_tokens: 50,
+          total_tokens: 1200,
+        },
+      }
+    })
+    const lm = bridge.createLanguageModel("gemini-4-neon")
+    const res = await lm.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      headers: { "x-opencode-session-id": "ses-usage-a-snake" },
+    } as any)
+    const parts = await readAllParts(res.stream)
+    const finish = parts.find((p) => p.type === "finish")
+    expect(finish.usage.inputTokens.total).toBe(1000)
+    expect(finish.usage.outputTokens.text).toBe(150)
+    expect(finish.usage.inputTokens.noCache).toBe(600)
+    await bridge.disposeAll()
+  })
+
+  test("b) usage_update used as fallback when prompt omits usage; used:0 ignored", async () => {
+    // Fallback: used > 0
+    {
+      const { bridge } = makeUsageBridge((onUpdate) => async (sid: string) => {
+        onUpdate?.(sid, { sessionUpdate: "usage_update", used: 4567 })
+        return { stopReason: "end_turn" }
+      })
+      const lm = bridge.createLanguageModel("gemini-4-neon")
+      const res = await lm.doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+        headers: { "x-opencode-session-id": "ses-usage-b-fallback" },
+      } as any)
+      const parts = await readAllParts(res.stream)
+      const finish = parts.find((p) => p.type === "finish")
+      expect(finish.usage.inputTokens.total).toBe(4567)
+      await bridge.disposeAll()
+    }
+    // Ignored: used = 0
+    {
+      const { bridge } = makeUsageBridge((onUpdate) => async (sid: string) => {
+        onUpdate?.(sid, { sessionUpdate: "usage_update", used: 0 })
+        return { stopReason: "end_turn" }
+      })
+      const lm = bridge.createLanguageModel("gemini-4-neon")
+      const res = await lm.doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+        headers: { "x-opencode-session-id": "ses-usage-b-zero" },
+      } as any)
+      const parts = await readAllParts(res.stream)
+      const finish = parts.find((p) => p.type === "finish")
+      expect(finish.usage.inputTokens.total).toBeUndefined()
+      await bridge.disposeAll()
+    }
+  })
+
+  test("c) lastContextUsed cleared at start of new turn (no bleed into turn 2)", async () => {
+    let calls = 0
+    const { bridge } = makeUsageBridge((onUpdate) => async (sid: string) => {
+      calls++
+      if (calls === 1) {
+        onUpdate?.(sid, { sessionUpdate: "usage_update", used: 9999 })
+        return { stopReason: "end_turn" }
+      }
+      return { stopReason: "end_turn" }
+    })
+    const lm = bridge.createLanguageModel("gemini-4-neon")
+    const sid = "ses-usage-c"
+    const res1 = await lm.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "turn one" }] }],
+      headers: { "x-opencode-session-id": sid },
+    } as any)
+    const parts1 = await readAllParts(res1.stream)
+    expect(parts1.find((p) => p.type === "finish")?.usage.inputTokens.total).toBe(9999)
+
+    const res2 = await lm.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "turn two" }] }],
+      headers: { "x-opencode-session-id": sid },
+    } as any)
+    const parts2 = await readAllParts(res2.stream)
+    expect(parts2.find((p) => p.type === "finish")?.usage.inputTokens.total).toBeUndefined()
+    await bridge.disposeAll()
+  })
+
+  test("d) finishTurnCleanStop preserves lastContextUsed after interrupt/error", async () => {
+    const { bridge } = makeUsageBridge((onUpdate) => async (sid: string) => {
+      onUpdate?.(sid, { sessionUpdate: "usage_update", used: 7777 })
+      throw new Error("API error (attempt 1): RESOURCE_EXHAUSTED (code 429): Individual quota reached")
+    })
+    const lm = bridge.createLanguageModel("gemini-4-neon")
+    const res = await lm.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      headers: { "x-opencode-session-id": "ses-usage-d" },
+    } as any)
+    const parts = await readAllParts(res.stream)
+    const finish = parts.find((p) => p.type === "finish")
+    expect(finish?.finishReason?.raw).toBe("quota_cooldown")
+    expect(finish?.usage.inputTokens.total).toBe(7777)
+    await bridge.disposeAll()
+  })
+})

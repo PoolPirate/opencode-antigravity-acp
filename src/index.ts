@@ -219,7 +219,7 @@ export default Plugin.define({
               }
               return Effect.promise(async () => {
                 if (evt.type === "session.deleted") {
-                  await bridge.resetSession(sid)
+                  await bridge.deleteSession(sid)
                   return
                 }
                 await bridge.handleInterrupt(

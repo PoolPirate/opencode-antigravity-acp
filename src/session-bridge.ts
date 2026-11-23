@@ -99,6 +99,7 @@ interface PendingMcpCall {
   emittedToOpenCode: boolean
   resolved: boolean
   readonly resolve: (res: McpCallToolResult) => void
+  abortCleanup?: () => void
 }
 
 interface ActiveTurn {
@@ -250,21 +251,39 @@ function catalogSignature(models: readonly AcpDiscoveredModel[]): string {
   return JSON.stringify(models.map((m) => [m.id, m.name, m.family, m.defaultAcpModelId, m.variants]))
 }
 
-function zeroUsage(
+function buildUsage(
   raw?: AcpPromptResult["usage"],
   activeContextUsed?: number,
 ): LanguageModelV3Usage {
-  const inputTotal = activeContextUsed !== undefined ? activeContextUsed : raw?.inputTokens
+  const r = raw as (NonNullable<AcpPromptResult["usage"]> & Record<string, unknown>) | undefined
+  const asNum = (v: unknown): number | undefined =>
+    typeof v === "number" && Number.isFinite(v) ? v : undefined
+  const rawInput = asNum(r?.inputTokens) ?? asNum(r?.input_tokens)
+  const rawOutput = asNum(r?.outputTokens) ?? asNum(r?.output_tokens)
+  const rawTotal = asNum(r?.totalTokens) ?? asNum(r?.total_tokens)
+  const rawCacheRead = asNum(r?.cachedReadTokens) ?? asNum(r?.cached_read_tokens)
+  const rawCacheWrite = asNum(r?.cachedWriteTokens) ?? asNum(r?.cached_write_tokens)
+  const reasoning = asNum(r?.thoughtTokens) ?? asNum(r?.thought_tokens)
+  const derivedInputFromTotal =
+    rawTotal !== undefined && rawOutput !== undefined
+      ? Math.max(0, rawTotal - rawOutput)
+      : undefined
+  const fallbackContext =
+    typeof activeContextUsed === "number" &&
+    Number.isFinite(activeContextUsed) &&
+    activeContextUsed > 0
+      ? activeContextUsed
+      : undefined
+  const inputTotal = rawInput ?? derivedInputFromTotal ?? fallbackContext
   const cacheRead =
-    raw?.cachedReadTokens !== undefined && inputTotal !== undefined
-      ? Math.min(raw.cachedReadTokens, inputTotal)
-      : raw?.cachedReadTokens
+    rawCacheRead !== undefined && inputTotal !== undefined
+      ? Math.min(rawCacheRead, inputTotal)
+      : rawCacheRead
   const cacheWrite =
-    raw?.cachedWriteTokens !== undefined && inputTotal !== undefined
-      ? Math.min(raw.cachedWriteTokens, Math.max(0, inputTotal - (cacheRead ?? 0)))
-      : raw?.cachedWriteTokens
-  const outputTotal = raw?.outputTokens
-  const reasoning = raw?.thoughtTokens
+    rawCacheWrite !== undefined && inputTotal !== undefined
+      ? Math.min(rawCacheWrite, Math.max(0, inputTotal - (cacheRead ?? 0)))
+      : rawCacheWrite
+  const outputTotal = rawOutput
   const noCache =
     inputTotal !== undefined
       ? Math.max(0, inputTotal - (cacheRead ?? 0) - (cacheWrite ?? 0))
@@ -298,6 +317,17 @@ function sanitizeMcpToolName(name: string, used: Set<string>): string {
   return candidate
 }
 
+function enrichMcpToolDescription(toolName: string, rawDescription: string): string {
+  const base = rawDescription.trim() || `OpenCode tool: ${toolName}`
+  if (toolName === "subagent") {
+    return `${base}\n\nOpenCode agents include "explore" (read-only search/review), "general", "build", and "plan". Optional \`model\` uses "<provider>/<modelID>" (run \`opencode models\` only if you need to look up an exact model ID).`
+  }
+  if (toolName === "execute") {
+    return `${base}\n\nOpenCode Code Mode JavaScript runtime: call \`await tools.<namespace>.<tool>(...)\` or \`await search({ query })\` to inspect hidden MCP and workspace tool namespaces.`
+  }
+  return base
+}
+
 function buildDescriptors(
   tools: Record<string, { readonly description: string; readonly input: any }>,
   includeNativeShadowed: boolean,
@@ -313,7 +343,7 @@ function buildDescriptors(
     mcpSafeToOriginal.set(safeName, toolName)
     mcpDescriptors.push({
       name: safeName,
-      description: info.description || `OpenCode tool: ${toolName}`,
+      description: enrichMcpToolDescription(toolName, info.description || ""),
       inputSchema: info.input,
     })
   }
@@ -931,6 +961,15 @@ export class SessionBridgeManager {
     return this.getState(sessionID)
   }
 
+  async deleteSession(sessionID: string): Promise<void> {
+    await this.resetSession(sessionID)
+    const s = this.sessions.get(sessionID)
+    if (s && !s.activeTurn && !s.startLock) {
+      this.sessions.delete(sessionID)
+    }
+    this.notifyChanged(sessionID)
+  }
+
   /**
    * Soft reset for model-switch handoffs: closes the old ACP session
    * server-side but KEEPS the live `agy` proc (no respawn, no re-auth).
@@ -963,6 +1002,35 @@ export class SessionBridgeManager {
           } catch {}
         }
         await this.handleInterrupt(sessionID, "Session reset for handoff")
+        const settling = s.settlingPrompt
+        if (settling) {
+          let settleTimer: ReturnType<typeof setTimeout> | undefined
+          const hung = await Promise.race([
+            settling.then(
+              () => false,
+              () => false,
+            ),
+            new Promise<true>((resolve) => {
+              settleTimer = setTimeout(() => resolve(true), SETTLING_PROMPT_TIMEOUT_MS)
+            }),
+          ])
+          if (settleTimer) clearTimeout(settleTimer)
+          if (hung) {
+            const wedged = s.proc
+            if (wedged && !wedged.isClosed) {
+              this.intentionallyDisposed.add(wedged)
+              this.activeProcs.delete(wedged)
+              try {
+                await wedged.dispose()
+              } catch {}
+            } else if (wedged) {
+              this.activeProcs.delete(wedged)
+            }
+            s.proc = undefined
+            s.acpSessionId = undefined
+            if (s.settlingPrompt === settling) s.settlingPrompt = undefined
+          }
+        }
         if (s.proc && !s.proc.isClosed && s.acpSessionId) {
           try {
             await s.proc.closeSession(s.acpSessionId)
@@ -1002,10 +1070,19 @@ export class SessionBridgeManager {
     for (const call of turn.pendingMcpCalls.values()) {
       if (!call.resolved) {
         call.resolved = true
+        try {
+          call.abortCleanup?.()
+        } catch {}
+        call.abortCleanup = undefined
         call.resolve({
           content: [{ type: "text", text: reason }],
           isError: true,
         })
+      } else {
+        try {
+          call.abortCleanup?.()
+        } catch {}
+        call.abortCleanup = undefined
       }
     }
     turn.pendingMcpCalls.clear()
@@ -1035,10 +1112,19 @@ export class SessionBridgeManager {
     for (const call of turn.pendingMcpCalls.values()) {
       if (!call.resolved) {
         call.resolved = true
+        try {
+          call.abortCleanup?.()
+        } catch {}
+        call.abortCleanup = undefined
         call.resolve({
           content: [{ type: "text", text }],
           isError: true,
         })
+      } else {
+        try {
+          call.abortCleanup?.()
+        } catch {}
+        call.abortCleanup = undefined
       }
     }
     turn.pendingMcpCalls.clear()
@@ -1068,7 +1154,7 @@ export class SessionBridgeManager {
     this.emitPart(turn, {
       type: "finish",
       finishReason: { unified: "stop", raw: rawFinish },
-      usage: zeroUsage(),
+      usage: buildUsage(turn.promptResult?.usage, s.lastContextUsed),
       ...meta,
     })
     const ctrl = this.detachController(turn)
@@ -1109,6 +1195,9 @@ export class SessionBridgeManager {
           true,
         )
       }
+    }
+    const disposeJobs: Promise<void>[] = []
+    for (const s of snapshot) {
       if (s.proc) {
         const proc = s.proc
         const acpSid = s.acpSessionId
@@ -1116,20 +1205,36 @@ export class SessionBridgeManager {
         s.proc = undefined
         s.acpSessionId = undefined
         if (!proc.isClosed && acpSid) {
-          proc.notifyCancel(acpSid)
+          try {
+            proc.notifyCancel(acpSid)
+          } catch {}
         }
-        await proc.dispose()
         this.activeProcs.delete(proc)
+        disposeJobs.push(
+          (async () => {
+            try {
+              await proc.dispose()
+            } catch {}
+          })(),
+        )
       }
     }
-    for (const proc of [...this.activeProcs]) {
-      this.intentionallyDisposed.add(proc)
-      await proc.dispose()
-    }
+    await Promise.allSettled(disposeJobs)
+    const remaining = [...this.activeProcs]
+    await Promise.allSettled(
+      remaining.map(async (proc) => {
+        this.intentionallyDisposed.add(proc)
+        try {
+          await proc.dispose()
+        } catch {}
+      }),
+    )
     this.activeProcs.clear()
     this.sessions.clear()
     this.warmedIdleSessions.length = 0
-    await this.mcpRelay.stop()
+    try {
+      await this.mcpRelay.stop()
+    } catch {}
   }
 
   private notifyChanged(sessionID: string): void {
@@ -1229,6 +1334,10 @@ export class SessionBridgeManager {
             s.lastModelId = undefined
             s.lastModeApplied = undefined
             s.lastError = null
+            if (s.mode !== "default") {
+              await proc.setMode(s.acpSessionId, s.mode).catch(() => {})
+              s.lastModeApplied = s.mode
+            }
             await this.runStorageSet(s.sessionID, s.acpSessionId)
             this.notifyChanged(s.sessionID)
             return { proc, acpSessionId: s.acpSessionId, freshSession: true }
@@ -1490,17 +1599,40 @@ export class SessionBridgeManager {
       return
     }
     s.lastError = `agy acp exited (code=${code}, signal=${signal})${tail ? `: ${tail.split("\n").at(-1)}` : ""}`
+    s.acpSessionId = undefined
+    s.acpToolsSignature = undefined
+    s.lastModelId = undefined
+    s.lastModeApplied = undefined
+    s.settlingPrompt = undefined
+    s.pendingFreshHandoff = undefined
     if (s.activeTurn) {
+      const turn = s.activeTurn
+      if (turn.flushTimer) {
+        clearTimeout(turn.flushTimer)
+        turn.flushTimer = undefined
+      }
       this.finishControllerWithError(
-        s.activeTurn,
+        turn,
         new Error(s.lastError),
       )
-      for (const c of s.activeTurn.pendingMcpCalls.values()) {
+      for (const c of turn.pendingMcpCalls.values()) {
         if (!c.resolved) {
           c.resolved = true
+          try {
+            c.abortCleanup?.()
+          } catch {}
+          c.abortCleanup = undefined
           c.resolve({ content: [{ type: "text", text: "ACP process exited" }], isError: true })
+        } else {
+          try {
+            c.abortCleanup?.()
+          } catch {}
+          c.abortCleanup = undefined
         }
       }
+      turn.pendingMcpCalls.clear()
+      turn.dispatchedCallIds.clear()
+      turn.bufferedParts.length = 0
       s.activeTurn = undefined
     }
     if (s.proc === proc) s.proc = undefined
@@ -1603,6 +1735,7 @@ export class SessionBridgeManager {
       const onAbort = () => {
         if (!entry.resolved) {
           entry.resolved = true
+          entry.abortCleanup = undefined
           turn.pendingMcpCalls.delete(toolCallId)
           resolve({
             content: [{ type: "text", text: "MCP tool call aborted by ACP host." }],
@@ -1611,6 +1744,7 @@ export class SessionBridgeManager {
         }
       }
       signal.addEventListener("abort", onAbort, { once: true })
+      entry.abortCleanup = () => signal.removeEventListener("abort", onAbort)
 
       this.scheduleFlushToolCalls(s, turn)
     })
@@ -1669,7 +1803,7 @@ export class SessionBridgeManager {
     this.emitPart(turn, {
       type: "finish",
       finishReason,
-      usage: zeroUsage(),
+      usage: buildUsage(),
       providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
     })
     const ctrl = this.detachController(turn)
@@ -1984,6 +2118,31 @@ export class SessionBridgeManager {
   }
 
   private finalizeTurnStop(s: BridgeSession, turn: ActiveTurn): void {
+    if (turn.flushTimer) {
+      clearTimeout(turn.flushTimer)
+      turn.flushTimer = undefined
+    }
+    for (const call of turn.pendingMcpCalls.values()) {
+      if (!call.resolved) {
+        call.resolved = true
+        try {
+          call.abortCleanup?.()
+        } catch {}
+        call.abortCleanup = undefined
+        call.resolve({
+          content: [{ type: "text", text: "Turn ended before OpenCode tool dispatch." }],
+          isError: true,
+        })
+      } else {
+        try {
+          call.abortCleanup?.()
+        } catch {}
+        call.abortCleanup = undefined
+      }
+    }
+    turn.pendingMcpCalls.clear()
+    turn.dispatchedCallIds.clear()
+
     this.closeOpenBlocks(turn)
     this.finishUnconfirmedNativeTools(turn)
 
@@ -1994,7 +2153,7 @@ export class SessionBridgeManager {
     this.emitPart(turn, {
       type: "finish",
       finishReason: { unified, raw: stopReason ?? "end_turn" },
-      usage: zeroUsage(turn.promptResult?.usage, s.lastContextUsed),
+      usage: buildUsage(turn.promptResult?.usage, s.lastContextUsed),
       providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
     })
 
@@ -2035,7 +2194,7 @@ export class SessionBridgeManager {
         controller.enqueue({
           type: "finish",
           finishReason: { unified: "stop", raw: rawFinish },
-          usage: zeroUsage(),
+          usage: buildUsage(),
           ...localMeta,
         })
         controller.close()
@@ -2056,7 +2215,7 @@ export class SessionBridgeManager {
         const texts: string[] = []
         const reasonings: string[] = []
         let finishReason: LanguageModelV3FinishReason = { unified: "stop", raw: "stop" }
-        let usage: LanguageModelV3Usage = zeroUsage()
+        let usage: LanguageModelV3Usage = buildUsage()
 
         while (true) {
           const { done, value } = await reader.read()
@@ -2115,14 +2274,23 @@ export class SessionBridgeManager {
                 existingTurn.pendingMcpCalls.delete(callId)
                 if (!pending.resolved) {
                   pending.resolved = true
+                  try {
+                    pending.abortCleanup?.()
+                  } catch {}
+                  pending.abortCleanup = undefined
                   const res = matchedResults.get(callId) ?? {
-                    text: "Tool returned no output",
-                    isError: false,
+                    text: "Tool result missing for " + callId,
+                    isError: true,
                   }
                   pending.resolve({
                     content: [{ type: "text", text: res.text }],
                     isError: res.isError,
                   })
+                } else {
+                  try {
+                    pending.abortCleanup?.()
+                  } catch {}
+                  pending.abortCleanup = undefined
                 }
               }
 
@@ -2364,6 +2532,7 @@ export class SessionBridgeManager {
           dispatchedCallIds: new Set(),
           promptSettled: false,
         }
+        s.lastContextUsed = undefined
         s.activeTurn = turn
         bridge.notifyChanged(sessionID)
 
@@ -2455,7 +2624,16 @@ export class SessionBridgeManager {
               for (const c of turn.pendingMcpCalls.values()) {
                 if (!c.resolved) {
                   c.resolved = true
+                  try {
+                    c.abortCleanup?.()
+                  } catch {}
+                  c.abortCleanup = undefined
                   c.resolve({ content: [{ type: "text", text: error.message }], isError: true })
+                } else {
+                  try {
+                    c.abortCleanup?.()
+                  } catch {}
+                  c.abortCleanup = undefined
                 }
               }
               turn.pendingMcpCalls.clear()
