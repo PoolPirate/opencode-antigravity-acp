@@ -55,7 +55,7 @@ function summarizeToolResultValue(result: any): string {
 export function sanitizeForNonAcpModel(messages: any[]): void {
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i]
-    if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) continue
+    if (!msg || !Array.isArray(msg.content)) continue
 
     let changed = false
     const nextContent: any[] = []
@@ -64,27 +64,47 @@ export function sanitizeForNonAcpModel(messages: any[]): void {
         nextContent.push(part)
         continue
       }
-      const isAcpHosted =
-        (part.type === "tool-call" || part.type === "tool-result") &&
-        part.providerExecuted === true &&
-        (Boolean(part.providerMetadata?.[ACP_PROVIDER_ID]) ||
-          String(part.name ?? "").startsWith("acp_"))
 
-      if (isAcpHosted) {
+      if (part.type === "compaction") {
         changed = true
-        if (part.type === "tool-call") {
-          nextContent.push({
-            type: "text",
-            text: `[Antigravity tool call \`${part.name}\`: ${stringifyCompact(part.input, 1200)}]`,
-          })
-        } else {
-          nextContent.push({
-            type: "text",
-            text: `[Antigravity tool \`${part.name}\` result: ${summarizeToolResultValue(part.result)}]`,
-          })
-        }
+        nextContent.push({
+          type: "text",
+          text: part.text
+            ? `[Prior conversation summary]\n${String(part.text)}`
+            : "[Prior conversation checkpoint]",
+        })
         continue
       }
+
+      if (part.type === "effort") {
+        changed = true
+        continue
+      }
+
+      if (msg.role === "assistant") {
+        const isAcpHosted =
+          (part.type === "tool-call" || part.type === "tool-result") &&
+          part.providerExecuted === true &&
+          (Boolean(part.providerMetadata?.[ACP_PROVIDER_ID]) ||
+            String(part.name ?? "").startsWith("acp_"))
+
+        if (isAcpHosted) {
+          changed = true
+          if (part.type === "tool-call") {
+            nextContent.push({
+              type: "text",
+              text: `[Antigravity tool call \`${part.name}\`: ${stringifyCompact(part.input, 1200)}]`,
+            })
+          } else {
+            nextContent.push({
+              type: "text",
+              text: `[Antigravity tool \`${part.name}\` result: ${summarizeToolResultValue(part.result)}]`,
+            })
+          }
+          continue
+        }
+      }
+
       nextContent.push(part)
     }
 
@@ -93,7 +113,13 @@ export function sanitizeForNonAcpModel(messages: any[]): void {
       messages[i] =
         merged.length > 0
           ? { ...msg, content: merged }
-          : { ...msg, content: [{ type: "text", text: "[Antigravity turn completed]" }] }
+          : {
+              ...msg,
+              content: [{
+                type: "text",
+                text: msg.role === "assistant" ? "[Antigravity turn completed]" : "[Checkpoint]",
+              }],
+            }
     }
   }
 }
