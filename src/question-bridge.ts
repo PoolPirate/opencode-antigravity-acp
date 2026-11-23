@@ -17,8 +17,12 @@ export interface OpenCodeQuestion {
 
 export interface BridgedQuestions {
   readonly questions: readonly OpenCodeQuestion[]
-  /** Maps answers (labels or typed text, per question) back to elicitation content. */
-  readonly respond: (answers: ReadonlyArray<readonly string[]>) => AcpElicitationContent
+  /**
+   * Maps answers (labels or typed text, per question) back to elicitation
+   * content. Returns `undefined` when nothing was answered, so the caller can
+   * cancel instead of sending agy a schema-violating empty payload.
+   */
+  readonly respond: (answers: ReadonlyArray<readonly string[] | undefined>) => AcpElicitationContent | undefined
 }
 
 export type AcpElicitationContent = Record<string, string | string[]>
@@ -92,7 +96,8 @@ export function elicitationToQuestions(params: AcpElicitationRequestParams): Bri
   for (const [key, value] of Object.entries(properties)) {
     const match = QUESTION_KEY.exec(key)
     const field = asRecord(value)
-    if (!match || !field) return undefined
+    // Ignore unrelated metadata fields instead of declining the whole form.
+    if (!match || !field) continue
     const entry = fields.get(Number(match[1])) ?? {}
     entry[match[2] ? "other" : "choice"] = field
     fields.set(Number(match[1]), entry)
@@ -115,6 +120,7 @@ export function elicitationToQuestions(params: AcpElicitationRequestParams): Bri
     })),
     respond: (answers) => {
       const content: AcpElicitationContent = {}
+      let answered = false
       plans.forEach((plan, index) => {
         const values: string[] = []
         const typed: string[] = []
@@ -125,10 +131,15 @@ export function elicitationToQuestions(params: AcpElicitationRequestParams): Bri
         }
         if (plan.choiceKey && values.length > 0) {
           content[plan.choiceKey] = plan.multiple ? values : values[0]
+          answered = true
         }
-        if (plan.textKey && typed.length > 0) content[plan.textKey] = typed.join(", ")
+        if (plan.textKey && typed.length > 0) {
+          content[plan.textKey] = typed.join(", ")
+          answered = true
+        }
       })
-      return content
+      // Nothing answered (dismissed or empty form): cancel, don't accept {}.
+      return answered ? content : undefined
     },
   }
 }
@@ -137,27 +148,59 @@ const ANSWER_PREFIX = "User has answered your questions: "
 const ANSWER_SUFFIX = ". You can now continue with the user's answers in mind."
 const UNANSWERED = "Unanswered"
 
+function dequote(value: string): string {
+  return value.replace(/\\"/g, '"').replace(/^"/, "").replace(/"$/, "")
+}
+
+/**
+ * Matches the `"<question>"="` head of one answer. Falls back to matching the
+ * dequoted label when the question text itself contains quotes.
+ */
+function matchHead(body: string, position: number, question: string): number | undefined {
+  const strict = `"${question}"="`
+  if (body.startsWith(strict, position)) return position + strict.length
+  const marker = body.indexOf('="', position)
+  if (marker < 0) return undefined
+  if (dequote(body.slice(position, marker + 1)) !== question) return undefined
+  return marker + 2
+}
+
+/** Finds the `", "<next question>"="` separator, tolerating quotes in titles. */
+function findSeparator(body: string, from: number, nextQuestion: string): number | undefined {
+  const exact = body.indexOf(`", "${nextQuestion}"="`, from)
+  if (exact >= 0) return exact
+  let at = body.indexOf('", "', from)
+  while (at >= 0) {
+    const marker = body.indexOf('="', at + 3)
+    if (marker < 0) return undefined
+    if (dequote(body.slice(at + 3, marker + 1)) === nextQuestion) return at
+    at = body.indexOf('", "', at + 1)
+  }
+  return undefined
+}
+
 /**
  * Parses the model-facing text of OpenCode's `question` tool:
  * `User has answered your questions: "Q1"="a, b", "Q2"="c". You can now ...`.
  * Uses the known questions and option labels to split the joined answers.
+ * Returns `undefined` per question when that question's answers cannot be read.
  */
 export function parseQuestionToolAnswers(
   text: string,
   questions: readonly OpenCodeQuestion[],
-): string[][] | undefined {
+): Array<string[] | undefined> | undefined {
   if (!text.startsWith(ANSWER_PREFIX) || !text.endsWith(ANSWER_SUFFIX)) return undefined
   const body = text.slice(ANSWER_PREFIX.length, text.length - ANSWER_SUFFIX.length)
-  const answers: string[][] = []
+  const answers: Array<string[] | undefined> = []
   let position = 0
   for (let i = 0; i < questions.length; i++) {
-    const head = `"${questions[i].question}"="`
-    if (!body.startsWith(head, position)) return undefined
-    position += head.length
+    const head = matchHead(body, position, questions[i].question)
+    if (head === undefined) return undefined
+    position = head
     let raw: string
     if (i + 1 < questions.length) {
-      const end = body.indexOf(`", "${questions[i + 1].question}"="`, position)
-      if (end < 0) return undefined
+      const end = findSeparator(body, position, questions[i + 1].question)
+      if (end === undefined) return undefined
       raw = body.slice(position, end)
       position = end + 3
     } else {

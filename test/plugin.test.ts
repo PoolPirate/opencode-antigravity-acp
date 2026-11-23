@@ -2820,7 +2820,14 @@ describe("Antigravity questions via OpenCode's question tool", () => {
           dispose: async () => {},
           prompt: async (sessionId: string) => {
             if (beforeAsk) beforeAsk(onUpdate!, sessionId)
-            else onUpdate?.(sessionId, { sessionUpdate: "tool_call", toolCallId: "ask", kind: "other", status: "in_progress" })
+            else
+              onUpdate?.(sessionId, {
+                sessionUpdate: "tool_call",
+                toolCallId: "ask",
+                kind: "other",
+                status: "in_progress",
+                rawInput: { questions: [{ question: "What is your favorite color?" }] },
+              })
             responses.push(await onElicitation!(agyForm))
             onUpdate?.(sessionId, { sessionUpdate: "tool_call_update", toolCallId: "ask", status: "completed" })
             onUpdate?.(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Thanks" } })
@@ -2937,5 +2944,38 @@ describe("Antigravity questions via OpenCode's question tool", () => {
     expect(parts.find((p) => p.type === "tool-call" && p.toolName === "question")).toBeUndefined()
     expect(responses).toEqual([{ action: "cancel" }])
     await bridge.disposeAll()
+  })
+
+  test("never settles an unrelated native tool when the elicitation arrives first", async () => {
+    // Elicitation arrives before agy's ask_question tool_call update, so only
+    // an unrelated running tool is visible. The bridge must not fabricate that
+    // tool's result; the question is still asked.
+    const { bridge, lm, headers, user, responses } = makeQuestionBridge(true, (onUpdate, sid) => {
+      onUpdate(sid, { sessionUpdate: "tool_call", toolCallId: "run", name: "run_command", status: "in_progress" })
+    })
+    const parts = await readAllParts((await lm.doStream({ prompt: [user], headers } as any)).stream)
+    expect(parts.find((p) => p.type === "tool-call" && p.toolName === "question")).toBeDefined()
+    expect(parts.find((p) => p.type === "tool-result" && p.toolCallId === "run")).toBeUndefined()
+    await bridge.disposeAll()
+    // Never answered: the elicitation is cancelled, not invented.
+    expect(responses).toEqual([{ action: "cancel" }])
+  })
+
+  test("parses answers when a question title contains quotes", async () => {
+    const { parseQuestionToolAnswers } = await import("../src/question-bridge.js")
+    const questions = [
+      { header: "Q", question: 'What does "foo" mean?', options: [{ label: "A", description: "" }] },
+      { header: "Q", question: "Second?", options: [{ label: "B", description: "" }] },
+    ]
+    const text =
+      'User has answered your questions: "What does "foo" mean?"="A", "Second?"="B". ' +
+      "You can now continue with the user's answers in mind."
+    expect(parseQuestionToolAnswers(text, questions)).toEqual([["A"], ["B"]])
+  })
+
+  test("respond refuses to accept an empty answer set", async () => {
+    const { elicitationToQuestions } = await import("../src/question-bridge.js")
+    const bridged = elicitationToQuestions(agyForm)!
+    expect(bridged.respond([[], [], []])).toBeUndefined()
   })
 })
