@@ -44,3 +44,13 @@ Pull requests **must** preserve these core invariants:
 2. Add or update unit tests in `test/` for your changes.
 3. Ensure `bun run typecheck`, `bun test`, and `bun run build` all pass.
 4. Open a pull request with a clear summary of what changed and how it was tested.
+
+## Releasing
+
+Releases publish to npm automatically — no tokens, no 2FA prompts:
+
+1. Bump the version in `package.json`, `src/acp-client.ts` (`clientInfo.version`), and `src/mcp-relay.ts` (`serverInfo.version`) so all three match.
+2. Commit, then tag and push: `git tag vX.Y.Z && git push origin main vX.Y.Z` (the tag must equal `package.json` `version`, or CI fails loudly).
+3. The `publish` workflow runs `typecheck` + `test` + `build`, then `npm publish --provenance` via OIDC trusted publishing.
+
+One-time setup (repo owner only): on npmjs.com, open the package Settings → Trusted Publisher and add this GitHub repository. After that, publishing needs no stored secrets.

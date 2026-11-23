@@ -1,0 +1,39 @@
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # Sigstore provenance attestation
+  id-token: write # npm OIDC trusted publishing, no stored tokens
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          # NOTE: no registry-url / NODE_AUTH_TOKEN on purpose. Auth uses
+          # npm OIDC trusted publishing, so there is no long-lived token and
+          # no 2FA prompt. The repo must be registered as a trusted publisher
+          # in the npm package settings (one-time manual step).
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun test
+      - run: bun run build
+      - name: Tag must match package.json version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(bun -e 'console.log(require("./package.json").version)')"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "tag v$TAG does not match package.json version $PKG"
+            exit 1
+          fi
+      - run: npm install -g npm@latest
+      - run: npm publish --provenance --access public
