@@ -156,6 +156,14 @@ interface BridgeSession {
   /** Foreground reservations held by live doStream turns (excluded from idle LRU). */
   foregroundCount?: number
   lastContextUsed?: number
+  /**
+   * Signature of the MCP tool set actually served to `acpSessionId` at
+   * session/new time (`agy acp` fetches `tools/list` once and caches it).
+   * Compared against the live snapshot in `ensureAcpSession` so a warmed
+   * empty-list session (or a mid-session tool change) forces a fresh ACP
+   * session instead of reusing a stale 0-tool id.
+   */
+  acpToolsSignature?: string
 }
 
 interface WarmSpare {
@@ -312,6 +320,19 @@ function buildDescriptors(
   return { mcpDescriptors, mcpSafeToOriginal }
 }
 
+/**
+ * Signature of the MCP tool set that `agy acp` actually sees for a session
+ * (`tools/list` is fetched once at session/new and cached per acpSessionId).
+ * Pure ACP is a constant; Code Mode fingerprints the live snapshot so a
+ * warmed empty-list session or a mid-session tool change is detectable.
+ */
+function acpToolsSignatureFor(s: BridgeSession): string {
+  if (!s.codeModeEnabled) return "pure"
+  const snap = s.contextSnapshot
+  if (!snap) return "code:__missing__"
+  return `code:${snap.toolSignature}`
+}
+
 function extractToolContentText(update: AcpSessionUpdate): unknown {
   if (update.rawOutput !== undefined) return update.rawOutput
   if (Array.isArray(update.content)) {
@@ -382,7 +403,7 @@ export class SessionBridgeManager {
 
   async start(): Promise<void> {
     // Lazy: only start the loopback relay when at least one session has
-    // opted into Code Mode. Pure ACP sessions never need it.
+    // Code Mode enabled. Pure ACP opt-out sessions never need it.
     for (const s of this.sessions.values()) {
       if (s.codeModeEnabled) {
         await this.mcpRelay.start()
@@ -587,7 +608,7 @@ export class SessionBridgeManager {
         sessionID,
         cwd: this.defaultCwd,
         mode: "auto",
-        codeModeEnabled: false,
+        codeModeEnabled: true,
         lastError: null,
         startGeneration: 0,
       }
@@ -657,6 +678,11 @@ export class SessionBridgeManager {
    * a spare initialized + authenticated proc is parked for the first real
    * `ses_...` session to claim. Never throws — the foreground turn surfaces
    * and retries any failure itself.
+   *
+   * Note: a warm may create the ACP session before `contextSnapshot` exists,
+   * so `agy acp` caches an empty `tools/list`. The first real turn detects
+   * the signature mismatch in `ensureAcpSession` and refreshes the session
+   * on the same proc (no extra spawn) with the correct tools.
    */
   async warmSession(sessionID?: string): Promise<SessionPublicState> {
     if (this.disposed) return this.getState(sessionID ?? "")
@@ -795,7 +821,7 @@ export class SessionBridgeManager {
     return {
       sessionID,
       mode: s?.mode ?? "auto",
-      codeModeEnabled: s?.codeModeEnabled ?? false,
+      codeModeEnabled: s?.codeModeEnabled ?? true,
       starting: Boolean(s?.startLock),
       acpSessionId: s?.acpSessionId ?? null,
       connected: Boolean(s?.proc && !s.proc.isClosed && s.acpSessionId),
@@ -887,6 +913,7 @@ export class SessionBridgeManager {
           this.activeProcs.delete(proc)
         }
         s.acpSessionId = undefined
+        s.acpToolsSignature = undefined
         s.lastModelId = undefined
         s.lastModeApplied = undefined
         s.lastError = null
@@ -898,6 +925,62 @@ export class SessionBridgeManager {
       } finally {
         if (s.resetLock === resetGate) s.resetLock = undefined
         releaseReset()
+      }
+    }
+    this.notifyChanged(sessionID)
+    return this.getState(sessionID)
+  }
+
+  /**
+   * Soft reset for model-switch handoffs: closes the old ACP session
+   * server-side but KEEPS the live `agy` proc (no respawn, no re-auth).
+   * The next turn creates a fresh ACP session on the same proc with the
+   * current tools and restores history via the plain-text handoff.
+   * Full `resetSession` (proc dispose) remains for user resets, mode flips,
+   * and error recovery.
+   */
+  async softResetForHandoff(sessionID: string): Promise<SessionPublicState> {
+    const s = this.sessions.get(sessionID)
+    if (s) {
+      let releaseReset!: () => void
+      const resetGate = new Promise<void>((r) => {
+        releaseReset = r
+      })
+      const prevReset = s.resetLock
+      s.resetLock = resetGate
+      this.untrackWarmedIdle(sessionID)
+      try {
+        if (prevReset) {
+          try {
+            await prevReset
+          } catch {}
+        }
+        s.startGeneration++
+        const inFlight = s.startLock
+        if (inFlight) {
+          try {
+            await inFlight
+          } catch {}
+        }
+        await this.handleInterrupt(sessionID, "Session reset for handoff")
+        if (s.proc && !s.proc.isClosed && s.acpSessionId) {
+          try {
+            await s.proc.closeSession(s.acpSessionId)
+          } catch {}
+        }
+        s.acpSessionId = undefined
+        s.acpToolsSignature = undefined
+        s.lastModelId = undefined
+        s.lastModeApplied = undefined
+        s.lastError = null
+        s.pendingFreshHandoff = undefined
+        s.settlingPrompt = undefined
+        s.lastContextUsed = undefined
+        this.untrackWarmedIdle(sessionID)
+        await this.runStorageRemove(sessionID)
+      } finally {
+        if (s.resetLock === resetGate) s.resetLock = undefined
+        releaseReset!()
       }
     }
     this.notifyChanged(sessionID)
@@ -943,6 +1026,7 @@ export class SessionBridgeManager {
     turn: ActiveTurn,
     text: string,
     rawFinish: string,
+    local = false,
   ): void {
     if (turn.flushTimer) {
       clearTimeout(turn.flushTimer)
@@ -963,10 +1047,13 @@ export class SessionBridgeManager {
     this.closeOpenBlocks(turn)
     this.finishUnconfirmedNativeTools(turn)
     const textId = `t_${++turn.partSeq}`
+    const meta = local
+      ? { providerMetadata: { [ACP_PROVIDER_ID]: { localStatus: true } } }
+      : { providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } } }
     this.emitPart(turn, {
       type: "text-start",
       id: textId,
-      providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+      ...meta,
     })
     this.emitPart(turn, {
       type: "text-delta",
@@ -976,13 +1063,13 @@ export class SessionBridgeManager {
     this.emitPart(turn, {
       type: "text-end",
       id: textId,
-      providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+      ...meta,
     })
     this.emitPart(turn, {
       type: "finish",
       finishReason: { unified: "stop", raw: rawFinish },
       usage: zeroUsage(),
-      providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+      ...meta,
     })
     const ctrl = this.detachController(turn)
     try {
@@ -1017,8 +1104,9 @@ export class SessionBridgeManager {
         this.finishTurnCleanStop(
           s,
           s.activeTurn,
-          "Antigravity ACP plugin was disabled or reloaded. Re-enable or send a new message to continue.",
+          "Plugin reloaded (e.g. file saved during development) — agy sessions were torn down. Send a new message to continue; history restores via text handoff.",
           "plugin_unloaded",
+          true,
         )
       }
       if (s.proc) {
@@ -1103,7 +1191,58 @@ export class SessionBridgeManager {
         continue
       }
       if (s.proc && !s.proc.isClosed && s.acpSessionId) {
-        return { proc: s.proc, acpSessionId: s.acpSessionId, freshSession: false }
+        // `agy acp` caches `tools/list` per acpSessionId: if the live snapshot
+        // now serves a different tool set than the session was created with
+        // (warmed empty list, or mid-session tool/agent change), refresh the
+        // ACP session on the SAME proc (no extra spawn) with the correct tools.
+        // freshSession=true arms the plain-text handoff so history is preserved.
+        if (s.acpToolsSignature !== undefined && s.acpToolsSignature !== acpToolsSignatureFor(s)) {
+          const proc = s.proc
+          const staleId = s.acpSessionId
+          try {
+            if (s.codeModeEnabled) {
+              await this.mcpRelay.start()
+            }
+          } catch {}
+          let relayUrl = ""
+          try {
+            relayUrl = s.codeModeEnabled ? this.mcpRelay.urlForSession(s.sessionID) : ""
+          } catch {}
+          const mcpServers = s.codeModeEnabled
+            ? [
+                {
+                  type: "http" as const,
+                  name: "oc",
+                  url: relayUrl,
+                  headers: this.mcpRelay.authHeaders(),
+                },
+              ]
+            : []
+          try {
+            if (!proc.isClosed && staleId) {
+              await proc.closeSession(staleId).catch(() => {})
+            }
+            const res = await proc.newSession({ cwd: s.cwd, mcpServers })
+            if (!res?.sessionId) throw new Error("empty sessionId from refreshed ACP session")
+            s.acpSessionId = String(res.sessionId)
+            s.acpToolsSignature = acpToolsSignatureFor(s)
+            s.lastModelId = undefined
+            s.lastModeApplied = undefined
+            s.lastError = null
+            await this.runStorageSet(s.sessionID, s.acpSessionId)
+            this.notifyChanged(s.sessionID)
+            return { proc, acpSessionId: s.acpSessionId, freshSession: true }
+          } catch {
+            // Refresh failed: drop the stale id so the full start path below
+            // spawns cleanly instead of reusing a broken session.
+            s.acpSessionId = undefined
+            s.acpToolsSignature = undefined
+            s.lastModelId = undefined
+            s.lastModeApplied = undefined
+          }
+        } else {
+          return { proc: s.proc, acpSessionId: s.acpSessionId, freshSession: false }
+        }
       }
       break
     }
@@ -1149,13 +1288,18 @@ export class SessionBridgeManager {
       throwIfStale()
 
       let disposedByBridge = false
-      // Claim a pre-warmed spare when it matches this session's cwd (already
-      // initialize()d + authenticate()d, mode-agnostic: MCP servers attach at
-      // session/new). Otherwise spawn fresh.
+      // Reuse the session's live proc when it survived a soft handoff reset
+      // (no respawn/re-auth: MCP servers attach per session/new). Otherwise
+      // claim a pre-warmed spare when it matches this session's cwd (already
+      // initialize()d + authenticate()d, mode-agnostic). Otherwise spawn fresh.
       let proc: AcpProcess
       let claimedSpare = false
+      let reusedLiveProc = false
       const spare = this.warmSpare
-      if (spare && !spare.proc.isClosed && spare.cwd === s.cwd && !spare.holder.owner) {
+      if (s.proc && !s.proc.isClosed) {
+        proc = s.proc
+        reusedLiveProc = true
+      } else if (spare && !spare.proc.isClosed && spare.cwd === s.cwd && !spare.holder.owner) {
         this.warmSpare = undefined
         spare.holder.owner = s
         proc = spare.proc
@@ -1174,7 +1318,7 @@ export class SessionBridgeManager {
       this.activeProcs.add(proc)
 
       try {
-        if (!claimedSpare) {
+        if (!claimedSpare && !reusedLiveProc) {
           await proc.initialize()
           if (this.disposed) throw new PluginDisposedError()
           // Explicit ACP auth: gemini-api-key when GEMINI_API_KEY is set,
@@ -1191,8 +1335,8 @@ export class SessionBridgeManager {
         // Unbounded waits above (initialize/authenticate, possibly gated for a
         // long time): re-check before touching storage or the ACP session.
         throwIfStale()
-        // Pure Thin ACP by default: zero bridged MCPs, 100% native agy acp.
-        // Opt-in Code Mode attaches only the single 'oc' Code Mode MCP server.
+        // Code Mode by default: attaches only the single 'oc' Code Mode MCP server.
+        // Pure ACP opt-out uses zero bridged MCPs, 100% native agy acp.
         const mcpServers = codeModeEnabled
           ? [
               {
@@ -1246,6 +1390,7 @@ export class SessionBridgeManager {
         }
         s.proc = proc
         s.acpSessionId = String(res.sessionId)
+        s.acpToolsSignature = acpToolsSignatureFor(s)
         s.lastError = null
         // A warm-driven fresh *replacement* (a stored id existed but resume
         // failed) owns no server-side history: arm the text-handoff restore
@@ -1287,6 +1432,7 @@ export class SessionBridgeManager {
         if (s.proc === proc) {
           s.proc = undefined
           s.acpSessionId = undefined
+          s.acpToolsSignature = undefined
         }
         await proc.dispose()
         throw err
@@ -2111,10 +2257,11 @@ export class SessionBridgeManager {
         // T3-Code-style create_with_handoff (v0.2.0): never hit a thread lock.
         // Normal ACP-to-ACP flow (no unseen non-ACP turns) uses the raw thin
         // prompt; switching back after normal-model turns starts a fresh agy
-        // session and sends a plain-text-only handoff (no tool/reasoning replay).
+        // session on the SAME live proc (no respawn/re-auth) and sends a
+        // plain-text-only handoff (no tool/reasoning replay).
         const needsHandoff = hasUnseenNonAcpAssistantHistory(options.prompt)
         if (needsHandoff) {
-          await bridge.resetSession(sessionID)
+          await bridge.softResetForHandoff(sessionID)
         }
 
         let ensured: { proc: AcpProcess; acpSessionId: string; freshSession: boolean }

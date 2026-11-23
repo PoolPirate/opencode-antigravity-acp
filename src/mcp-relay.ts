@@ -238,7 +238,7 @@ export class McpRelayServer {
         result = {
           protocolVersion: params.protocolVersion ?? "2025-03-26",
           capabilities: { tools: { listChanged: true } },
-          serverInfo: { name: "opencode-relay", version: "0.2.0" },
+          serverInfo: { name: "opencode-relay", version: "0.2.1" },
         }
       } else if (method === "tools/list") {
         const tools = this.handlers.getTools(sessionID).map((t) => ({

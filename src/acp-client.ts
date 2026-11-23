@@ -629,7 +629,7 @@ export class AcpProcess {
       {
         protocolVersion: 1,
         clientCapabilities: {},
-        clientInfo: { name: "acp-bridge", version: "0.2.0" },
+        clientInfo: { name: "acp-bridge", version: "0.2.1" },
       },
       15_000,
     )

@@ -589,10 +589,10 @@ describe("History sanitizer & cross-model context handoff", () => {
     expect(resolveAcpAuthMethod({} as any)).toBe("oauth-personal")
   })
 
-  test("thin-mode bridge defaults to Pure ACP and hands off non-ACP history without a thread lock", async () => {
+  test("thin-mode bridge defaults to Code Mode and hands off non-ACP history without a thread lock", async () => {
     const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir")
     const initial = bridge.getState("thin-sess")
-    expect(initial.codeModeEnabled).toBe(false)
+    expect(initial.codeModeEnabled).toBe(true)
     expect(initial.relayedToolCount).toBe(0)
 
     bridge.updateContextSnapshot("thin-sess", {
@@ -602,20 +602,28 @@ describe("History sanitizer & cross-model context handoff", () => {
     })
     expect(bridge.getState("thin-sess").relayedToolCount).toBe(0)
 
-    const enabled = await bridge.setCodeMode("thin-sess", true)
-    expect(enabled.codeModeEnabled).toBe(true)
+    bridge.updateContextSnapshot("thin-sess", {
+      systemText: "",
+      agent: "build",
+      tools: { mytool: { description: "r", input: { type: "object" } } },
+    })
+    expect(bridge.getState("thin-sess").relayedToolCount).toBe(1)
+
     const disabled = await bridge.setCodeMode("thin-sess", false)
     expect(disabled.codeModeEnabled).toBe(false)
     expect(disabled.relayedToolCount).toBe(0)
+    const enabled = await bridge.setCodeMode("thin-sess", true)
+    expect(enabled.codeModeEnabled).toBe(true)
+    expect(enabled.relayedToolCount).toBe(1)
 
     // v0.2.0: non-ACP history no longer returns thin_history_locked. It resets
     // to a fresh agy session and sends a plain-text-only handoff instead.
     // Mock the ACP transport so no real `agy` binary is spawned.
     let resetCalls = 0
-    const origReset = (bridge as any).resetSession.bind(bridge)
-    ;(bridge as any).resetSession = async (sid: string) => {
+    const origSoftReset = (bridge as any).softResetForHandoff.bind(bridge)
+    ;(bridge as any).softResetForHandoff = async (sid: string) => {
       resetCalls++
-      return origReset(sid)
+      return origSoftReset(sid)
     }
     let capturedPrompt: any[] | undefined
     ;(bridge as any).ensureAcpSession = async (s: any) => {
@@ -1051,6 +1059,81 @@ describe("History sanitizer & cross-model context handoff", () => {
     expect(parts.find((p) => p.type === "finish")?.finishReason?.unified).toBe("stop")
     expect(factoryCalls.length).toBe(1)
     expect(factoryCalls[0]._prompts).toHaveLength(1)
+    await bridge.disposeAll()
+  })
+
+  test("warmed empty tools/list refreshes on first real turn with same proc", async () => {
+    const newSessionCalls: any[] = []
+    let procInstance: any
+    const makeFakeProc = () => {
+      const state = { disposed: false, closed: false, prompts: [] as any[] }
+      const fake: any = {
+        get disposed() {
+          return state.disposed
+        },
+        get isClosed() {
+          return state.closed
+        },
+        initialize: async () => ({}),
+        authenticate: async () => ({}),
+        newSession: async (params: any) => {
+          newSessionCalls.push(params)
+          return { sessionId: `acp-sess-${newSessionCalls.length}` }
+        },
+        resumeSession: async (params: any) => ({ sessionId: params.sessionId }),
+        setModel: async () => {},
+        setMode: async () => {},
+        setConfigOption: async () => {},
+        closeSession: async () => {},
+        notifyCancel: () => {},
+        cancel: async () => {},
+        prompt: async (_sid: string, prompt: any[]) => {
+          state.prompts.push(prompt)
+          return { stopReason: "end_turn" }
+        },
+        dispose: async () => {
+          state.disposed = true
+          state.closed = true
+        },
+        _prompts: state.prompts,
+      }
+      procInstance = fake
+      return fake
+    }
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+      createProc: () => makeFakeProc(),
+    })
+
+    // Warm creates the ACP session before contextSnapshot exists (empty tools).
+    await bridge.warmSession("ses-tools-refresh")
+    await waitFor(() => (bridge as any).getOrCreateSession("ses-tools-refresh").proc !== undefined)
+    expect(newSessionCalls).toHaveLength(1)
+    expect(newSessionCalls[0].mcpServers).toHaveLength(1)
+    const warmedId = (bridge as any).getOrCreateSession("ses-tools-refresh").acpSessionId
+    expect(warmedId).toBe("acp-sess-1")
+
+    // First real turn populates the snapshot (context hook) with a real tool.
+    // updateContextSnapshot runs before doStream in the real plugin (index.ts).
+    bridge.updateContextSnapshot("ses-tools-refresh", {
+      systemText: "",
+      agent: "build",
+      tools: { mytool: { description: "r", input: { type: "object" } } },
+    })
+
+    const lm = bridge.createLanguageModel("gemini-4-neon")
+    const res = await lm.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "hello with tools" }] }],
+      headers: { "x-opencode-session-id": "ses-tools-refresh" },
+    } as any)
+    const parts = await readAllParts(res.stream)
+    expect(parts.some((p) => p.type === "error")).toBe(false)
+    expect(parts.find((p) => p.type === "finish")?.finishReason?.unified).toBe("stop")
+    // Same proc reused (no extra spawn) but ACP session refreshed for tools.
+    expect(newSessionCalls).toHaveLength(2)
+    const refreshedId = (bridge as any).getOrCreateSession("ses-tools-refresh").acpSessionId
+    expect(refreshedId).toBe("acp-sess-2")
+    expect(refreshedId).not.toBe(warmedId)
+    expect((bridge as any).getOrCreateSession("ses-tools-refresh").proc).toBe(procInstance)
     await bridge.disposeAll()
   })
 

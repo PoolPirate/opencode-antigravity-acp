@@ -9,7 +9,7 @@ import {
 import { AcpRpc } from "./rpc.js"
 import { SessionBridgeManager } from "./session-bridge.js"
 
-function buildModelEntries(models: readonly AcpDiscoveredModel[]): any[] {
+function buildModelEntries(models: readonly AcpDiscoveredModel[], bridgeGeneration: string): any[] {
   return models.map((m) => ({
     id: m.id,
     modelID: m.id,
@@ -18,6 +18,13 @@ function buildModelEntries(models: readonly AcpDiscoveredModel[]): any[] {
     family: m.family ?? m.id,
     name: m.name,
     package: "aisdk:antigravity-acp",
+    // Per-bridge-generation marker. OpenCode caches LanguageModelV3 objects
+    // keyed by {providerID, id, modelID, package, settings, headers, body,
+    // limit} and never evicts on plugin reload, so a reloaded plugin would
+    // otherwise keep resolving to the disposed bridge's stale LM. Bumping this
+    // inert settings field forces a cache miss so turns resolve to the live
+    // bridge. Ignored semantically (our sdk/language hooks override everything).
+    settings: { antigravityBridgeGeneration: bridgeGeneration },
     capabilities: {
       tools: true,
       input: ["text", "image"],
@@ -54,6 +61,7 @@ export default Plugin.define({
   id: ACP_PROVIDER_ID,
   effect: (ctx) =>
     Effect.gen(function* () {
+      const bridgeGeneration = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
       const bridge = new SessionBridgeManager(ctx, ctx.location.directory, undefined, {
         onCatalogChanged: () => {
           Effect.runFork(ctx.provider.reload().pipe(Effect.catch(() => Effect.void)))
@@ -75,7 +83,7 @@ export default Plugin.define({
             activation: "enabled",
             package: "aisdk:antigravity-acp",
           } as any,
-          models: buildModelEntries(bridge.getModels()) as any,
+          models: buildModelEntries(bridge.getModels(), bridgeGeneration) as any,
         })
       })
 
@@ -101,10 +109,11 @@ export default Plugin.define({
         { providerID: ACP_PROVIDER_ID as any },
       )
 
-      // Strict Thin ACP Mode: zero outer-harness prompt/tool injection.
-      // Snapshot the live tool catalog for the optional Code Mode MCP relay,
-      // then clear outer system instructions AND tool schemas so OpenCode
-      // does not inject anything into the ACP model call.
+      // Thin ACP: zero outer-harness prompt injection. Snapshot the live tool
+      // catalog for the Code Mode MCP relay (default), then always clear outer
+      // system instructions. `input.tools` is preserved in Code Mode so
+      // `mcp_oc_*` round-trips are permitted, cleared (`{}`) in Pure ACP
+      // opt-out (schemas are never injected either way).
       yield* ctx.session.hook("context", (input) =>
         Effect.sync(() => {
           if (input.model.providerID === ACP_PROVIDER_ID) {
@@ -115,7 +124,13 @@ export default Plugin.define({
               tools: input.tools,
             })
             input.system = []
-            input.tools = {}
+            // Only clear OpenCode's request tool allowlist in Pure ACP mode;
+            // when + Code Mode is enabled, OpenCode needs `input.tools` intact
+            // so `mcp_oc_*` tool-call round-trips (e.g. `execute`) are permitted
+            // (our `doStream` ignores `options.tools` and never injects schemas).
+            if (!bridge.getState(input.sessionID).codeModeEnabled) {
+              input.tools = {}
+            }
           } else {
             sanitizeForNonAcpModel(input.messages as any[])
           }

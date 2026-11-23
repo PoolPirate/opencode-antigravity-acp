@@ -549,7 +549,7 @@ export default Plugin.define({
       })
 
       const activeMode = (): AcpMode => state()?.mode ?? "auto"
-      const codeModeEnabled = () => state()?.codeModeEnabled ?? false
+      const codeModeEnabled = () => state()?.codeModeEnabled ?? true
       const activeModeMeta = () => MODE_OPTIONS.find((m) => m.id === activeMode()) ?? MODE_OPTIONS[0]
 
       const cooldownSeconds = () => {
@@ -597,7 +597,7 @@ export default Plugin.define({
 
       const bridgeBadgeText = () => {
         const st = state()
-        if (!st) return "Pure ACP"
+        if (!st) return "Code Mode"
         if (st.codeModeEnabled) {
           return st.relayedToolCount > 0 ? `Code Mode (${st.relayedToolCount})` : "Code Mode"
         }
@@ -778,8 +778,8 @@ export default Plugin.define({
             </div>
             <p id={bridgeHintId} class="agy-hint">
               {codeModeEnabled()
-                ? "Attaches only the single 'oc' Code Mode MCP server (zero prompt injection; switching reconnects with a plain-text handoff of conversation context)."
-                : "Pure ACP default: mcpServers [], zero bridged MCPs, 100% native agy acp (switching reconnects with a plain-text handoff of conversation context)."}
+                ? "Code Mode default: attaches only the single 'oc' Code Mode MCP server (zero prompt injection; switching reconnects with a plain-text handoff of conversation context)."
+                : "Pure ACP opt-out: mcpServers [], zero bridged MCPs, 100% native agy acp (switching reconnects with a plain-text handoff of conversation context)."}
             </p>
           </div>
 
