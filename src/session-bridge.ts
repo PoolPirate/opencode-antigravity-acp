@@ -108,7 +108,7 @@ interface ActiveTurn {
   openTextId?: string
   openReasoningId?: string
   partSeq: number
-  readonly activeNativeTools: Set<string>
+  readonly activeNativeTools: Map<string, string>
   readonly relayedUpdateIds: Set<string>
   readonly pendingMcpCalls: Map<string, PendingMcpCall>
   readonly dispatchedCallIds: Set<string>
@@ -961,6 +961,7 @@ export class SessionBridgeManager {
     turn.dispatchedCallIds.clear()
 
     this.closeOpenBlocks(turn)
+    this.finishUnconfirmedNativeTools(turn)
     const textId = `t_${++turn.partSeq}`
     this.emitPart(turn, {
       type: "text-start",
@@ -1754,22 +1755,25 @@ export class SessionBridgeManager {
 
     if (kind === "tool_call" || kind === "tool_call_update") {
       const callId = String(update.toolCallId ?? "")
-      if (!callId) return
-      const name = String(update.name ?? update.kind ?? "acp_tool")
-
-      // Relayed OpenCode MCP tools are already emitted natively from handleIncomingMcpCall!
-      if (name.startsWith("mcp_oc_") || turn.relayedUpdateIds.has(callId)) {
-        turn.relayedUpdateIds.add(callId)
-        return
-      }
+      if (!callId || turn.relayedUpdateIds.has(callId)) return
 
       const status = String(update.status ?? "")
-      if (kind === "tool_call" && !turn.activeNativeTools.has(callId)) {
+      // OpenCode requires the result to use the name emitted on the call.
+      let displayName = turn.activeNativeTools.get(callId)
+      if (displayName === undefined) {
+        const name = String(update.name ?? update.kind ?? "tool")
+        // Relayed MCP calls already have their own OpenCode tool parts.
+        if (name.startsWith("mcp_oc_")) {
+          turn.relayedUpdateIds.add(callId)
+          return
+        }
+        if (kind !== "tool_call") return
+
         this.closeOpenBlocks(turn)
-        turn.activeNativeTools.add(callId)
+        displayName = `acp_${name}`
+        turn.activeNativeTools.set(callId, displayName)
         const rawInput = update.rawInput ?? update.args ?? {}
         const jsonInput = JSON.stringify(rawInput)
-        const displayName = `acp_${name}`
         this.emitPart(turn, {
           type: "tool-input-start",
           id: callId,
@@ -1793,15 +1797,10 @@ export class SessionBridgeManager {
           providerExecuted: true,
           providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
         })
-        return
       }
 
-      if (
-        (status === "completed" || status === "failed" || status === "error" || status === "cancelled") &&
-        turn.activeNativeTools.has(callId)
-      ) {
+      if (status === "completed" || status === "failed" || status === "error" || status === "cancelled") {
         turn.activeNativeTools.delete(callId)
-        const displayName = `acp_${name}`
         const isError = status !== "completed"
         const resultPayload = extractToolContentText(update)
         this.emitPart(turn, {
@@ -1821,22 +1820,26 @@ export class SessionBridgeManager {
     }
   }
 
-  private finalizeTurnStop(s: BridgeSession, turn: ActiveTurn): void {
-    // Emit any remaining buffered native chunks, close open text/reasoning, emit finish:stop
-    this.closeOpenBlocks(turn)
-    if (turn.activeNativeTools.size > 0) {
-      for (const id of turn.activeNativeTools) {
-        this.emitPart(turn, {
-          type: "tool-result",
-          toolCallId: id,
-          toolName: "acp_tool",
-          result: { status: "completed" },
-          isError: false,
-          providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
-        })
-      }
-      turn.activeNativeTools.clear()
+  private finishUnconfirmedNativeTools(turn: ActiveTurn): void {
+    for (const [toolCallId, toolName] of turn.activeNativeTools) {
+      this.emitPart(turn, {
+        type: "tool-result",
+        toolCallId,
+        toolName,
+        result: {
+          status: "unknown",
+          message: "ACP did not report a final status for this tool call.",
+        },
+        isError: true,
+        providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+      })
     }
+    turn.activeNativeTools.clear()
+  }
+
+  private finalizeTurnStop(s: BridgeSession, turn: ActiveTurn): void {
+    this.closeOpenBlocks(turn)
+    this.finishUnconfirmedNativeTools(turn)
 
     const stopReason = turn.promptResult?.stopReason
     const unified: LanguageModelV3FinishReason["unified"] =
@@ -2208,7 +2211,7 @@ export class SessionBridgeManager {
         const turn: ActiveTurn = {
           bufferedParts: [],
           partSeq: 0,
-          activeNativeTools: new Set(),
+           activeNativeTools: new Map(),
           relayedUpdateIds: new Set(),
           pendingMcpCalls: new Map(),
           dispatchedCallIds: new Set(),
