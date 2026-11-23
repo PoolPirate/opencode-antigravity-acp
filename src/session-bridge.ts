@@ -15,6 +15,8 @@ import {
   discoverAcpModels,
   resolveAcpModelTarget,
   type AcpDiscoveredModel,
+  type AcpElicitationRequestParams,
+  type AcpElicitationResponse,
   type AcpPermissionOutcome,
   type AcpPermissionRequestParams,
   type AcpProcessOptions,
@@ -31,6 +33,14 @@ import {
   isSyntheticRestartAfterError,
 } from "./history-sanitizer.js"
 import { McpRelayServer, type McpCallToolResult, type McpToolDescriptor } from "./mcp-relay.js"
+import {
+  elicitationToQuestions,
+  parseQuestionToolAnswers,
+  type OpenCodeQuestion,
+} from "./question-bridge.js"
+
+/** OpenCode's built-in tool that asks the user questions. */
+const OPENCODE_QUESTION_TOOL = "question"
 
 export type AcpMode = "auto" | "accept-edits" | "default" | "plan"
 
@@ -66,6 +76,8 @@ const NATIVE_SHADOWED_TOOLS = new Set([
   "glob",
   "ls",
   "list",
+  // agy's own ask_question is bridged to this tool, so don't offer it twice.
+  OPENCODE_QUESTION_TOOL,
 ])
 
 export interface SessionContextSnapshot {
@@ -100,6 +112,10 @@ interface PendingMcpCall {
   resolved: boolean
   readonly resolve: (res: McpCallToolResult) => void
   abortCleanup?: () => void
+  /** An Antigravity question relayed to OpenCode's `question` tool. */
+  readonly userInput?: boolean
+  /** agy's own pending ask_question call, closed when the question is shown. */
+  readonly nativeToolCallId?: string
 }
 
 interface ActiveTurn {
@@ -110,6 +126,8 @@ interface ActiveTurn {
   openReasoningId?: string
   partSeq: number
   readonly activeNativeTools: Map<string, string>
+  /** Searchable title/name/input of native tool calls, to find agy's ask_question call. */
+  nativeToolText?: Map<string, string>
   readonly relayedUpdateIds: Set<string>
   readonly pendingMcpCalls: Map<string, PendingMcpCall>
   readonly dispatchedCallIds: Set<string>
@@ -756,6 +774,10 @@ export class SessionBridgeManager {
           holder.owner
             ? this.handlePermissionRequest(holder.owner, params)
             : Promise.resolve({ outcome: "cancelled" as const }),
+        onElicitation: (params) =>
+          holder.owner
+            ? this.handleElicitation(holder.owner, params)
+            : Promise.resolve({ action: "decline" as const }),
         onExit: (code, signal, tail) => {
           this.activeProcs.delete(proc)
           const owner = holder.owner
@@ -1419,6 +1441,7 @@ export class SessionBridgeManager {
           dangerouslySkipPermissions: false,
           onUpdate: (_sid, update) => this.handleAcpUpdate(s, update),
           onPermissionRequest: (params) => this.handlePermissionRequest(s, params),
+          onElicitation: (params) => this.handleElicitation(s, params),
           onExit: (code, signal, tail) => {
             this.handleProcExit(s, proc, code, signal, tail, disposedByBridge)
           },
@@ -1702,6 +1725,68 @@ export class SessionBridgeManager {
     }
   }
 
+  private async handleElicitation(
+    s: BridgeSession,
+    params: AcpElicitationRequestParams,
+  ): Promise<AcpElicitationResponse> {
+    const bridged = elicitationToQuestions(params)
+    if (!bridged) return { action: "decline" }
+    const answers = await this.askOpenCodeQuestions(s, bridged.questions, params.toolCallId)
+    if (!answers) return { action: "cancel" }
+    return { action: "accept", content: bridged.respond(answers) }
+  }
+
+  /**
+   * Asks through OpenCode's native `question` tool by emitting a tool call in
+   * the active turn, like a relayed MCP call. Resolves with one answer list per
+   * question, or `undefined` when the question is unavailable or dismissed.
+   */
+  private async askOpenCodeQuestions(
+    s: BridgeSession,
+    questions: readonly OpenCodeQuestion[],
+    toolCallIdHint?: string,
+  ): Promise<string[][] | undefined> {
+    const turn = s.activeTurn
+    if (!turn || !s.contextSnapshot?.tools[OPENCODE_QUESTION_TOOL]) return undefined
+    const nativeToolCallId = this.findNativeQuestionCall(turn, questions, toolCallIdHint)
+
+    const toolCallId = `oc_question_${++turn.partSeq}_${Math.random().toString(36).slice(2, 8)}`
+    const result = await new Promise<McpCallToolResult>((resolve) => {
+      turn.pendingMcpCalls.set(toolCallId, {
+        toolCallId,
+        mcpName: OPENCODE_QUESTION_TOOL,
+        openCodeToolName: OPENCODE_QUESTION_TOOL,
+        args: { questions },
+        emittedToOpenCode: false,
+        resolved: false,
+        resolve,
+        userInput: true,
+        nativeToolCallId,
+      })
+      this.scheduleFlushToolCalls(s, turn)
+    })
+    if (result.isError) return undefined
+    return parseQuestionToolAnswers(result.content.map((c) => c.text).join("\n"), questions)
+  }
+
+  /**
+   * Finds agy's open ask_question call: the ACP-provided tool call ID, else the
+   * open call whose input or title contains the question, else the newest one.
+   */
+  private findNativeQuestionCall(
+    turn: ActiveTurn,
+    questions: readonly OpenCodeQuestion[],
+    hint?: string,
+  ): string | undefined {
+    if (hint && turn.activeNativeTools.has(hint)) return hint
+    const open = [...turn.activeNativeTools.keys()]
+    const firstQuestion = questions[0]?.question
+    const byText = firstQuestion
+      ? open.find((id) => turn.nativeToolText?.get(id)?.includes(firstQuestion))
+      : undefined
+    return byText ?? open.at(-1)
+  }
+
   private async handleIncomingMcpCall(
     sessionID: string,
     mcpToolName: string,
@@ -1760,11 +1845,16 @@ export class SessionBridgeManager {
 
   private tryFlushToolCalls(s: BridgeSession, turn: ActiveTurn): void {
     if (!turn.controller) return
-    // Wait for any concurrent Antigravity native hosted tool calls to settle first
-    if (turn.activeNativeTools.size > 0) return
-
     const unsent = [...turn.pendingMcpCalls.values()].filter((c) => !c.emittedToOpenCode)
     if (unsent.length === 0) return
+
+    // agy's own ask_question call stays open until it is answered, so close
+    // just that call here; its later updates are ignored.
+    for (const call of unsent) {
+      if (call.nativeToolCallId) this.settleNativeToolForUserInput(turn, call.nativeToolCallId)
+    }
+    // Wait for any other concurrent Antigravity native hosted tool calls to settle first
+    if (turn.activeNativeTools.size > 0) return
 
     this.closeOpenBlocks(turn)
     for (const call of unsent) {
@@ -2054,6 +2144,7 @@ export class SessionBridgeManager {
         turn.activeNativeTools.set(callId, displayName)
         const rawInput = update.rawInput ?? update.args ?? {}
         const jsonInput = JSON.stringify(rawInput)
+        ;(turn.nativeToolText ??= new Map()).set(callId, `${name}\n${update.title ?? ""}\n${jsonInput}`)
         this.emitPart(turn, {
           type: "tool-input-start",
           id: callId,
@@ -2098,6 +2189,22 @@ export class SessionBridgeManager {
         }
       }
     }
+  }
+
+  /** Closes agy's ask_question call; the OpenCode question part shows the answer. */
+  private settleNativeToolForUserInput(turn: ActiveTurn, toolCallId: string): void {
+    const toolName = turn.activeNativeTools.get(toolCallId)
+    if (toolName === undefined) return
+    turn.activeNativeTools.delete(toolCallId)
+    turn.relayedUpdateIds.add(toolCallId)
+    this.emitPart(turn, {
+      type: "tool-result",
+      toolCallId,
+      toolName,
+      result: { status: "asked", message: "Asked the user with OpenCode's question tool." },
+      isError: false,
+      providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+    })
   }
 
   private finishUnconfirmedNativeTools(turn: ActiveTurn): void {
